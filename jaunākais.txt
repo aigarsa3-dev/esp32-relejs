@@ -1,0 +1,215 @@
+# ==============================================================================
+# AUTOMĀTISKA ELEKTRĪBAS BIRŽAS CENAS KONTROLE (ESP32 + MicroPython)
+# ==============================================================================
+# Šī programma regulāri (ik pēc 15 minūtēm) nolasa aktuālo Nord Pool elektroenerģijas
+# biržas cenu Latvijas (LV) apgabalam un ieslēdz vai izslēdz releju (piemēram,
+# boilerim vai siltumsūknim), ja cena ir zemāka par norādīto slieksni.
+# ==============================================================================
+
+import network      # Bibliotēka Wi-Fi bezvadu tīkla savienojuma izveidei
+import time         # Bibliotēka laika uzskaitei un pauzēm (sleep)
+import urequests    # Bibliotēka HTTP/HTTPS pieprasījumu sūtīšanai uz internetu
+import ntptime      # Bibliotēka precīza laika sinhronizācijai no interneta (NTP)
+import json         # Bibliotēka JSON datu formāta apstrādei
+import machine      # Bibliotēka aparatūras kontrolei (piem., mikrokontroliera restarts)
+from machine import Pin  # Modulis fizisko izvadu (GPIO kontaktu) vadībai
+
+# ------------------------------------------------------------------------------
+# 1. KONFIGURĀCIJA (Šeit var mainīt iestatījumus pēc savām vajadzībām)
+# ------------------------------------------------------------------------------
+WIFI_SSID = 'Nakotnes4'         # Jūsu Wi-Fi tīkla nosaukums
+WIFI_PASS = 'saule2000'         # Jūsu Wi-Fi tīkla parole
+
+# Publisks un bezmaksas ENTSO-E biržas cenu API Latvijas zonai (LV).
+# Atgriež datus JSON formātā (laiks UTC zonā, cena EUR/MWh).
+URL = "https://spot.utilitarian.io/electricity/LV/latest/"
+
+# Cenas slieksnis EUR/kWh (ar PVN), pie kura vai zem kura relejs IESLĒGSIES.
+PRICE_THRESHOLD = 0.02          # Piemēram, 0.02 EUR/kWh (2 centi par kilovatstundu)
+VAT_MULTIPLIER = 1.21           # PVN koeficients Latvijā (21% = 1.21)
+
+INTERVAL_SECONDS = 900          # Pārbaudes intervāls sekundēs (900 sek. = 15 minūtes)
+RELAY_PIN = 4                   # GPIO kontakta numurs, pie kura pievienots relejs
+
+# Inicializējam releja kontaktu kā izeju (OUT) un uzreiz drošības labad izslēdzam
+relay = Pin(RELAY_PIN, Pin.OUT)
+relay.off()
+
+
+# ------------------------------------------------------------------------------
+# 2. FUNKCIJA: PIESLĒGŠANĀS WI-FI TĪKLAM
+# ------------------------------------------------------------------------------
+def connect_wifi():
+    """Izveido savienojumu ar norādīto Wi-Fi tīklu."""
+    print("Savienojas ar Wi-Fi tīklu", end="")
+    sta_if = network.WLAN(network.STA_IF)  # Aktivizējam Wi-Fi klienta (Station) režīmu
+    sta_if.active(True)
+    
+    # Ja savienojums vēl nav izveidots, mēģinām pieslēgties
+    if not sta_if.isconnected():
+        sta_if.connect(WIFI_SSID, WIFI_PASS)
+        retry = 0
+        # Gaidām savienojumu līdz 20 sekundēm (20 mēģinājumi pa 1 sekundi)
+        while not sta_if.isconnected() and retry < 20:
+            print(".", end="")
+            time.sleep(1)
+            retry += 1
+            
+    # Pārbaudām rezultātu
+    if sta_if.isconnected():
+        print(" Savienots!")
+        print("ESP32 IP adrese:", sta_if.ifconfig()[0])
+        return True
+    else:
+        print(" Neizdevās pieslēgties Wi-Fi.")
+        return False
+
+
+# ------------------------------------------------------------------------------
+# 3. FUNKCIJA: PULKSTEŅA SINHRONIZĀCIJA NO INTERNETA (NTP)
+# ------------------------------------------------------------------------------
+def sync_time():
+    """Iestata precīzu sistēmas laiku no NTP servera (UTC laika zonā)."""
+    print("Sinhronizē laiku ar NTP serveri...", end="")
+    try:
+        # ntptime.settime() uzstāda ESP32 iekšējo pulksteni uz UTC (Griničas) laiku.
+        # Tas ir ļoti svarīgi, jo arī biržas API laiki ir UTC zonā.
+        ntptime.settime()
+        print(" Gatavs.")
+        print("Pašreizējais laiks (UTC):", time.localtime())
+    except Exception as e:
+        print(" Kļūda sinhronizējot laiku:", e)
+
+
+# ------------------------------------------------------------------------------
+# 4. GALVENAIS UZDEVUMS: CENAS IEGŪŠANA UN RELEJA VADĪBA
+# ------------------------------------------------------------------------------
+def task():
+    """Lejupielādē biržas cenas, atrod pašreizējo 15 minūšu intervālu un vada releju."""
+    print("\n--- Sāku cenas pārbaudes uzdevumu ---")
+    try:
+        # 1. Nosūtām pieprasījumu uz serveri un nolasām JSON datus
+        resp = urequests.get(URL, timeout=10)
+        prices = resp.json()
+        resp.close()  # Obligāti aizveram savienojumu, lai atbrīvotu ESP32 operatīvo atmiņu (RAM)
+        
+        # 2. Nosakām pašreizējo UTC datumu, stundu un 15 minūšu bloku (00, 15, 30 vai 45)
+        now = time.localtime()
+        # time.localtime() atgriež kortežu: (gads, mēnesis, diena, stunda, minūte, sekunde, ...)
+        current_date = f"{now[0]:04d}-{now[1]:02d}-{now[2]:02d}"  # Piemēram: "2026-11-18"
+        current_hour = now[3]                                    # Piemēram: 18
+        current_minute = now[4]                                  # Piemēram: 26
+        
+        # Noapaļojam minūtes uz leju līdz tuvākajam ceturksnim (piem., 26 -> 15; 42 -> 30)
+        target_minute_block = (current_minute // 15) * 15
+        
+        current_mw_price = None  # Mainīgais atrastajai cenai (EUR/MWh)
+        
+        # 3. Meklējam sarakstā ierakstu, kas precīzi sakrīt ar šodienas datumu, stundu un 15 min. bloku
+        for entry in prices:
+            ts = entry["timestamp"]  # Laika zīmogs no API, piemēram: "2026-11-18T18:15:00+00:00"
+            try:
+                entry_date = ts[0:10]        # Izgriežam datumu: "2026-11-18"
+                entry_hour = int(ts[11:13])  # Izgriežam stundu: 18
+                entry_min = int(ts[14:16])   # Izgriežam minūtes: 15
+                
+                if (entry_date == current_date and 
+                    entry_hour == current_hour and 
+                    entry_min == target_minute_block):
+                    # API atgriež cenu kā tekstu ("27.67"), tāpēc pārvēršam to skaitlī ar float()
+                    current_mw_price = float(entry["value"])
+                    print(f"Atrasts precīzs 15 min. laika intervāls: {ts}")
+                    break
+            except Exception:
+                continue  # Ja kāds ieraksts ir bojāts, pārejam pie nākamā
+                
+        # 4. Rezerves variants: ja konkrētajam tirgum dati ir pa stundām (nevis pa 15 min.),
+        # meklējam atbilstību tikai pēc datuma un stundas (piem., minūtes ir 00).
+        if current_mw_price is None:
+            target_prefix = f"{current_date}T{current_hour:02d}"
+            for entry in prices:
+                if entry["timestamp"].startswith(target_prefix):
+                    current_mw_price = float(entry["value"])
+                    print(f"Atrasts stundas intervāls: {entry['timestamp']}")
+                    break
+
+        # Ja cenu tā arī neizdevās atrast, pārtraucam šo ciklu
+        if current_mw_price is None:
+            print("KĻŪDA: Neizdevās atrast cenu pašreizējam laika intervālam.")
+            return
+
+        # 5. Aprēķinām gala cenu patērētājam (EUR/kWh ar PVN)
+        # Biržas cena ir par megavatstundu (MWh), tāpēc dalām ar 1000, lai iegūtu EUR/kWh
+        price_per_kwh = current_mw_price / 1000.0
+        price_with_tax = price_per_kwh * VAT_MULTIPLIER
+        
+        print(f"Biržas cena (bez PVN): {current_mw_price:.2f} EUR/MWh")
+        print(f"Gala cena (ar PVN):    {price_with_tax:.4f} EUR/kWh")
+        
+        # 6. Salīdzinām cenu ar slieksni un vadām releju
+        if price_with_tax <= PRICE_THRESHOLD:
+            argument = "IESLĒGTS (ON)"
+            relay.on()   # Padodam signālu relejam (ieslēdzam slodzi)
+        else:
+            argument = "IZSLĒGTS (OFF)"
+            relay.off()  # Noņemam signālu relejam (izslēdzam slodzi)
+            
+        print(f"Releja stāvoklis: {argument}")
+        
+    except OSError as e:
+        print("Tīkla kļūda pieprasījuma laikā (nav interneta vai serveris neatbild):", e)
+    except ValueError as e:
+        print("Kļūda apstrādājot saņemtos JSON datus:", e)
+    except Exception as e:
+        print("Negaidīta kļūda:", e)
+
+
+# ------------------------------------------------------------------------------
+# 5. FUNKCIJA: MIEGA ILGUMA APRĒĶINS LĪDZ NĀKAMAJAM CETURKSNIM
+# ------------------------------------------------------------------------------
+def get_seconds_to_next_interval():
+    """Aprēķina, cik sekundes jāgaida līdz nākamajai XX:00, XX:15, XX:30 vai XX:45 minūtei."""
+    now = time.localtime()
+    minutes = now[4]  # Pašreizējās minūtes
+    seconds = now[5]  # Pašreizējās sekundes
+    
+    # Cik sekundes pagājušas kopš stundas sākuma
+    seconds_past_hour = (minutes * 60) + seconds
+    
+    # Cik sekundes pagājušas pašreizējā 15 minūšu (900 sekunžu) ciklā
+    seconds_into_cycle = seconds_past_hour % INTERVAL_SECONDS
+    
+    # Atlikušais laiks līdz nākamajam 15 minūšu intervālam
+    return INTERVAL_SECONDS - seconds_into_cycle
+
+
+# ==============================================================================
+# 6. GALVENĀ PROGRAMMAS IZPILDE (Sākas šeit, kad ESP32 ieslēdzas)
+# ==============================================================================
+
+# Vispirms mēģinām pieslēgties Wi-Fi
+if connect_wifi():
+    # Ja Wi-Fi strādā, sinhronizējam pulksteni
+    sync_time()
+    
+    # Bezgalīgs cikls, kas darbojas 24/7
+    while True:
+        # Izpildām cenas pārbaudi un releja pārslēgšanu
+        task()
+        
+        # Aprēķinām, cik sekundes jāguļ līdz nākamajam 15 minūšu sākumam
+        sleep_duration = get_seconds_to_next_interval()
+        print(f"Uzdevums pabeigts. Guļu {sleep_duration} sekundes līdz nākamajam ceturksnim...")
+        
+        # Iemidzinām programmu līdz nākamajam intervālam
+        time.sleep(sleep_duration)
+        
+        # Reizi diennaktī (plkst. 03:00 UTC) atkārtoti sinhronizējam laiku, lai novērstu pulksteņa nobīdi
+        if time.localtime()[3] == 3 and time.localtime()[4] == 0:
+            sync_time()
+else:
+    # Ja sākumā neizdevās pieslēgties Wi-Fi (piem., rūteris vēl ieslēdzas pēc elektrības pazušanas),
+    # pagaidām 10 sekundes un pārstartējam ESP32, lai mēģinātu vēlreiz.
+    print("Neizdevās izveidot savienojumu. Pārstartēju ESP32 pēc 10 sekundēm...")
+    time.sleep(10)
+    machine.reset()
